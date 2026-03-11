@@ -1,23 +1,22 @@
 """
 answer.py — Called by the GitHub Actions comment bot workflow.
 
-Reads env vars set by the workflow, retrieves relevant doc chunks,
-calls Claude, then posts the answer back to the GitHub issue.
+Reads env vars set by the workflow, retrieves relevant doc chunks via local
+sentence-transformers embeddings, calls Claude for the answer, then posts the
+reply back to the GitHub issue. No OpenAI key needed.
 
 Environment variables expected:
-    OPENAI_API_KEY      — for embedding the user query
-    ANTHROPIC_API_KEY   — for generating the answer
+    ANTHROPIC_API_KEY   — for generating the answer via Claude
     GH_TOKEN            — GitHub token to post comment (GITHUB_TOKEN is fine)
     QUESTION            — raw comment body, e.g. "/ask How do I install this?"
     ISSUE_COMMENTS_URL  — GitHub API URL to post reply to
-    REPO_FULL_NAME      — e.g. "octocat/my-repo"
     COMMENT_USER        — GitHub username who asked
     INDEX_FILE          — (optional) path to docs_index.json
+    EMBED_MODEL         — (optional) HuggingFace model name, default all-MiniLM-L6-v2
 """
 
 import json
 import os
-import re
 import sys
 import urllib.request
 import urllib.error
@@ -25,45 +24,51 @@ import urllib.error
 import numpy as np
 
 try:
-    from openai import OpenAI
+    from sentence_transformers import SentenceTransformer
     from anthropic import Anthropic
 except ImportError:
-    print("Install: pip install openai anthropic numpy")
+    print("Install: pip install sentence-transformers anthropic numpy")
     sys.exit(1)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INDEX_FILE    = os.getenv("INDEX_FILE", "docs_index.json")
-EMBED_MODEL   = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-TOP_K         = int(os.getenv("TOP_K", "5"))
-TRIGGER       = os.getenv("TRIGGER", "/ask")
-MAX_TOKENS    = int(os.getenv("MAX_TOKENS", "1024"))
+INDEX_FILE  = os.getenv("INDEX_FILE", "docs_index.json")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
+TOP_K       = int(os.getenv("TOP_K", "5"))
+TRIGGER     = os.getenv("TRIGGER", "/ask")
+MAX_TOKENS  = int(os.getenv("MAX_TOKENS", "1024"))
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """a: (D,), b: (N, D) → (N,) similarities."""
-    a = a / (np.linalg.norm(a) + 1e-10)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-10)
-    return b_norm @ a
-
-
-def load_index(path: str) -> tuple[list[dict], np.ndarray]:
+def load_index(path: str) -> tuple[list[dict], np.ndarray, bool]:
     with open(path, "r") as f:
         data = json.load(f)
     chunks = data["chunks"]
     embeddings = np.array(data["embeddings"], dtype="float32")
-    return chunks, embeddings
+    normalized = data.get("normalized", False)
+    return chunks, embeddings, normalized
 
 
-def embed_query(query: str, client: OpenAI, model: str) -> np.ndarray:
-    response = client.embeddings.create(input=[query], model=model)
-    return np.array(response.data[0].embedding, dtype="float32")
+def embed_query(query: str, model: SentenceTransformer, normalized: bool) -> np.ndarray:
+    """Embed the query, matching the normalization used at index time."""
+    return model.encode(
+        [query],
+        normalize_embeddings=normalized,
+        convert_to_numpy=True,
+    )[0].astype("float32")
 
 
 def retrieve(query: str, chunks: list[dict], embeddings: np.ndarray,
-             oai_client: OpenAI, top_k: int) -> list[dict]:
-    q_emb = embed_query(query, oai_client, EMBED_MODEL)
-    sims = cosine_similarity(q_emb, embeddings)
+             model: SentenceTransformer, normalized: bool, top_k: int) -> list[dict]:
+    q_emb = embed_query(query, model, normalized)
+    if normalized:
+        # Both sides are unit vectors; dot product == cosine similarity
+        sims = embeddings @ q_emb
+    else:
+        # Compute cosine similarity manually
+        q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-10)
+        e_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10)
+        sims = e_norm @ q_norm
+
     top_indices = np.argsort(sims)[::-1][:top_k]
     results = []
     for idx in top_indices:
@@ -119,7 +124,6 @@ def post_github_comment(comments_url: str, body: str, token: str) -> None:
 
 
 def extract_question(comment_body: str, trigger: str) -> str | None:
-    """Strip the trigger prefix and return the question, or None if not a trigger."""
     body = comment_body.strip()
     if not body.lower().startswith(trigger.lower()):
         return None
@@ -136,16 +140,15 @@ def format_reply(question: str, answer: str, top_chunks: list[dict], user: str) 
         f"**Q: {question}**\n\n"
         f"{answer}\n\n"
         f"<details>\n<summary>Sources consulted</summary>\n\n{sources}\n\n</details>\n\n"
-        f"---\n*Powered by the docs-agent · [How it works](.github/workflows/docs-agent.yml)*"
+        f"---\n*Powered by docs-agent · [How it works](.github/workflows/docs-agent.yml)*"
     )
 
 
 def main():
-    # Read env
-    raw_comment   = os.environ.get("QUESTION", "")
-    comments_url  = os.environ.get("ISSUE_COMMENTS_URL", "")
-    gh_token      = os.environ.get("GH_TOKEN", "")
-    comment_user  = os.environ.get("COMMENT_USER", "user")
+    raw_comment  = os.environ.get("QUESTION", "")
+    comments_url = os.environ.get("ISSUE_COMMENTS_URL", "")
+    gh_token     = os.environ.get("GH_TOKEN", "")
+    comment_user = os.environ.get("COMMENT_USER", "user")
 
     question = extract_question(raw_comment, TRIGGER)
     if not question:
@@ -154,26 +157,29 @@ def main():
 
     print(f"Question: {question}")
 
-    # Load index
+    # Check index exists
     if not os.path.exists(INDEX_FILE):
-        error_msg = (
+        msg = (
             f"Hey @{comment_user}, the docs index hasn't been built yet. "
-            f"Please run the **Index Documentation** workflow first, "
-            f"or push a change to the `docs/` folder to trigger it."
+            f"Please run the **Index Documentation** workflow manually from the Actions tab, "
+            f"or push any change to the `docs/` folder to trigger it automatically."
         )
-        post_github_comment(comments_url, error_msg, gh_token)
+        post_github_comment(comments_url, msg, gh_token)
         sys.exit(0)
 
-    chunks, embeddings = load_index(INDEX_FILE)
-    print(f"Loaded index: {len(chunks)} chunks")
+    # Load index + local embedding model
+    chunks, embeddings, normalized = load_index(INDEX_FILE)
+    print(f"Loaded index: {len(chunks)} chunks (normalized={normalized})")
 
-    # Retrieve + answer
-    oai_client  = OpenAI()
-    anth_client = Anthropic()
+    print(f"Loading embedding model '{EMBED_MODEL}' ...")
+    model = SentenceTransformer(EMBED_MODEL)
 
-    top_chunks = retrieve(question, chunks, embeddings, oai_client, TOP_K)
+    # Retrieve relevant chunks
+    top_chunks = retrieve(question, chunks, embeddings, model, normalized, TOP_K)
     print(f"Top chunk scores: {[round(c['score'], 3) for c in top_chunks]}")
 
+    # Generate answer via Claude
+    anth_client = Anthropic()
     answer = build_answer(question, top_chunks, anth_client)
     reply  = format_reply(question, answer, top_chunks, comment_user)
 

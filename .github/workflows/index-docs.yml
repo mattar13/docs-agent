@@ -26,13 +26,21 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install openai numpy
+        run: pip install sentence-transformers numpy
+        # No API key needed — model downloads from HuggingFace on first run
+        # and is cached by the runner between runs via actions/cache below
+
+      - name: Cache HuggingFace model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-all-MiniLM-L6-v2
 
       - name: Build docs index
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DOCS_DIR: docs/         # Change this if your docs live elsewhere
           INDEX_FILE: docs_index.json
+          EMBED_MODEL: all-MiniLM-L6-v2
           CHUNK_SIZE: "400"
           CHUNK_OVERLAP: "50"
         run: python scripts/build_index.py

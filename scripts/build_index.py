@@ -1,11 +1,12 @@
 """
 build_index.py — Chunk and embed all docs into a searchable JSON index.
+Uses sentence-transformers locally — no API key or cost required.
+
 Run via GitHub Actions whenever docs/ changes, or locally with:
-    OPENAI_API_KEY=sk-... python scripts/build_index.py
+    python scripts/build_index.py
 """
 
 import json
-import glob
 import hashlib
 import os
 import sys
@@ -14,18 +15,18 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from openai import OpenAI
+    from sentence_transformers import SentenceTransformer
 except ImportError:
-    print("Install dependencies: pip install openai numpy")
+    print("Install dependencies: pip install sentence-transformers numpy")
     sys.exit(1)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DOCS_DIR       = os.getenv("DOCS_DIR", "docs/")
-OUTPUT_FILE    = os.getenv("INDEX_FILE", "docs_index.json")
-CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "400"))   # words per chunk
-CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "50")) # word overlap between chunks
-EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-EMBED_BATCH    = 100  # max texts per API call
+DOCS_DIR      = os.getenv("DOCS_DIR", "docs/")
+OUTPUT_FILE   = os.getenv("INDEX_FILE", "docs_index.json")
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "400"))    # words per chunk
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))  # word overlap
+EMBED_MODEL   = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")  # fast, 384-dim, free
+EMBED_BATCH   = int(os.getenv("EMBED_BATCH", "64"))
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -38,49 +39,53 @@ def find_doc_files(docs_dir: str) -> list[Path]:
 
 
 def chunk_text(text: str, source: str, chunk_size: int, overlap: int) -> list[dict]:
-    """Sliding-window word-level chunker."""
+    """Sliding-window word-level chunker with overlap."""
     words = text.split()
     chunks = []
-    step = chunk_size - overlap
+    step = max(1, chunk_size - overlap)
     for i in range(0, max(1, len(words)), step):
         window = words[i : i + chunk_size]
         if not window:
             break
-        chunk_text = " ".join(window)
-        chunk_id = hashlib.md5(f"{source}:{i}:{chunk_text}".encode()).hexdigest()[:12]
+        body = " ".join(window)
+        chunk_id = hashlib.md5(f"{source}:{i}:{body}".encode()).hexdigest()[:12]
         chunks.append({
             "id": chunk_id,
             "source": source,
-            "text": chunk_text,
-            "char_start": i,
+            "text": body,
+            "word_start": i,
         })
         if i + chunk_size >= len(words):
             break
     return chunks
 
 
-def embed_texts(texts: list[str], client: OpenAI, model: str) -> np.ndarray:
-    """Batch-embed a list of strings, returns (N, D) float32 array."""
-    all_embeddings = []
-    for i in range(0, len(texts), EMBED_BATCH):
-        batch = texts[i : i + EMBED_BATCH]
-        print(f"  Embedding batch {i // EMBED_BATCH + 1} / {(len(texts) - 1) // EMBED_BATCH + 1} ...")
-        response = client.embeddings.create(input=batch, model=model)
-        batch_embs = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
-        all_embeddings.extend(batch_embs)
-    return np.array(all_embeddings, dtype="float32")
+def embed_chunks(texts: list[str], model: SentenceTransformer) -> np.ndarray:
+    """Encode all texts locally in batches. Returns (N, D) float32 array."""
+    print(f"  Encoding {len(texts)} chunks in batches of {EMBED_BATCH} ...")
+    embeddings = model.encode(
+        texts,
+        batch_size=EMBED_BATCH,
+        show_progress_bar=True,
+        normalize_embeddings=True,  # pre-normalize for fast cosine via dot product
+        convert_to_numpy=True,
+    )
+    return embeddings.astype("float32")
 
 
 def main():
-    client = OpenAI()  # reads OPENAI_API_KEY from env
+    # Load local model (downloaded once, cached by HuggingFace)
+    print(f"Loading embedding model '{EMBED_MODEL}' ...")
+    model = SentenceTransformer(EMBED_MODEL)
+    print(f"  Embedding dimension: {model.get_sentence_embedding_dimension()}")
 
-    # 1. Find and chunk all doc files
+    # Find and chunk docs
     doc_files = find_doc_files(DOCS_DIR)
     if not doc_files:
         print(f"No doc files found in '{DOCS_DIR}'. Exiting.")
         sys.exit(0)
 
-    print(f"Found {len(doc_files)} doc file(s) in '{DOCS_DIR}'")
+    print(f"\nFound {len(doc_files)} doc file(s) in '{DOCS_DIR}'")
     all_chunks = []
     for path in doc_files:
         text = path.read_text(encoding="utf-8", errors="ignore")
@@ -90,14 +95,14 @@ def main():
 
     print(f"\nTotal chunks: {len(all_chunks)}")
 
-    # 2. Embed all chunks
-    print(f"\nEmbedding with model '{EMBED_MODEL}' ...")
+    # Embed
     texts = [c["text"] for c in all_chunks]
-    embeddings = embed_texts(texts, client, EMBED_MODEL)
+    embeddings = embed_chunks(texts, model)
 
-    # 3. Write index
+    # Write index
     index = {
         "model": EMBED_MODEL,
+        "normalized": True,  # embeddings are pre-normalized; use dot product for similarity
         "chunks": all_chunks,
         "embeddings": embeddings.tolist(),
     }
