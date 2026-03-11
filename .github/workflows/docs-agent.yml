@@ -1,0 +1,65 @@
+name: Docs Agent (Comment Bot)
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  answer:
+    # Only run if the comment starts with /ask
+    if: |
+      startsWith(github.event.comment.body, '/ask') &&
+      github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write    # post reply comment
+      contents: read   # read docs_index.json
+
+    steps:
+      - name: Checkout repo (with index)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install openai anthropic numpy
+
+      - name: React to comment (acknowledge)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Answer question
+        env:
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
+          QUESTION:             ${{ github.event.comment.body }}
+          ISSUE_COMMENTS_URL:   ${{ github.event.issue.comments_url }}
+          COMMENT_USER:         ${{ github.event.comment.user.login }}
+          TRIGGER:              "/ask"
+          TOP_K:                "5"
+          MAX_TOKENS:           "1024"
+        run: python scripts/answer.py
+
+      - name: Mark as answered (checkmark reaction)
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: '+1'
+            });
